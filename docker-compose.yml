@@ -54,6 +54,24 @@ services:
     stdin_open: true
     tty: true
 
+  # 游标分页自动化验证（一次性运行，退出码 0 表示通过）
+  cpp-test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: es-cursor-test
+    profiles:
+      - test
+    environment:
+      - ES_HOST=elasticsearch
+      - ES_PORT=9200
+    networks:
+      - es-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    command: ["./es_cursor_test"]
+
 networks:
   es-network:
     driver: bridge
@@ -65,3 +83,4 @@ volumes:
 # 使用说明：
 # - 默认启动: docker-compose up -d (仅 ES + C++ Demo)
 # - 启用 Kibana: docker-compose --profile kibana up -d
+# - 运行游标分页自动化验证: docker-compose --profile test up --build cpp-test

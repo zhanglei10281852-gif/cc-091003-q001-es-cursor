@@ -29,6 +29,7 @@ flowchart TD
 classDiagram
     class ESClient {
         -string baseUrl
+        -string cursorSecret
         -HttpClient httpClient
         +createIndex(indexName, mappings)
         +deleteIndex(indexName)
@@ -37,13 +38,33 @@ classDiagram
         +deleteDocument(index, id)
         +search(index, query)
         +bulkIndex(index, docs)
+        +openPointInTime(index, keepAlive)
+        +closePointInTime(pitId)
+        +cursorSearchFirst(request)
+        +cursorSearchNext(request, cursor)
+        +closeCursor(cursor)
     }
 
     class HttpClient {
         +get(url, headers)
         +post(url, body, headers)
         +put(url, body, headers)
-        +delete(url, headers)
+        +delete(url, body, headers)
+    }
+
+    class CursorSearchRequest {
+        +string index
+        +json query
+        +json sort
+        +int pageSize
+        +string keepAlive
+        +long cursorTtlSeconds
+    }
+
+    class CursorPage {
+        +SearchResult result
+        +string nextCursor
+        +bool hasMore
     }
 
     class Document {
@@ -56,6 +77,8 @@ classDiagram
 
     ESClient --> HttpClient
     ESClient --> Document
+    ESClient ..> CursorSearchRequest
+    ESClient ..> CursorPage
 ```
 
 ## 3. 功能清单
@@ -74,6 +97,11 @@ classDiagram
 | 全文检索 | Bool 查询  | 组合条件查询                   |
 | 全文检索 | 高亮显示   | 搜索结果高亮                   |
 | 全文检索 | 分页查询   | 支持 from/size                 |
+| 游标分页 | 建立快照   | 首次请求建立 PIT 并返回首页    |
+| 游标分页 | 稳定翻页   | search_after 前进，快照隔离增删 |
+| 游标分页 | 确定次序   | 自动追加 _shard_doc 决胜键     |
+| 游标分页 | 游标安全   | HMAC 签名 + 条件绑定 + 有效期  |
+| 游标分页 | 资源回收   | 末页/主动关闭 PIT，超时自回收  |
 
 ## 4. API 接口设计
 
@@ -93,6 +121,36 @@ classDiagram
 ### 4.3 搜索接口
 
 - `POST /{index}/_search` - 搜索文档
+
+### 4.4 游标分页接口（客户端封装）
+
+- `POST /{index}/_pit?keep_alive=2m` - 建立 Point in Time 快照
+- `POST /_search` - 携带 `pit` + `search_after` 翻页（路径不再带索引）
+- `DELETE /_pit` - 关闭 PIT（末页自动调用或主动结束）
+
+**游标格式**：`v1.<base64url(payload)>.<hmac-sha256-hex>`
+
+```json
+{
+  "v": 1,
+  "idx": "articles",          // 绑定的索引
+  "qh": "<sha256>",           // 查询条件指纹
+  "sh": "<sha256>",           // 排序指纹（含 _shard_doc 决胜键）
+  "sz": 100,                  // 绑定的页大小
+  "pit": "<PIT id>",
+  "sa": ["..."],              // 上一页末条记录的排序值
+  "exp": 1737000000           // 客户端侧过期时间
+}
+```
+
+**异常体系**（均可按类型区分捕获）：
+
+| 异常 | 含义 |
+| ---- | ---- |
+| `CursorTamperedException` | 游标被篡改或格式非法（签名不匹配） |
+| `CursorExpiredException` | 超过客户端侧有效期 cursorTtlSeconds |
+| `CursorMismatchException` | 游标与当前索引/查询/排序/页大小不绑定 |
+| `PitNotFoundException` | ES 侧 PIT 已关闭或超过 keep_alive 被回收 |
 
 ## 5. 技术选型
 
@@ -115,11 +173,16 @@ es-cpp-demo/
 │   ├── include/
 │   │   ├── es_client.hpp
 │   │   ├── http_client.hpp
+│   │   ├── sha256.hpp
 │   │   └── json.hpp
 │   ├── src/
 │   │   ├── main.cpp
 │   │   ├── es_client.cpp
-│   │   └── http_client.cpp
+│   │   ├── http_client.cpp
+│   │   └── sha256.cpp
+│   ├── tests/
+│   │   ├── cursor_test.cpp
+│   │   └── mock_es.py
 │   └── data/
 │       └── sample_data.json
 ├── docker-compose.yml

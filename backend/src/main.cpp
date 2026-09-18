@@ -3,6 +3,7 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace es;
@@ -391,8 +392,116 @@ void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
     }
 }
 
+void demoCursorPagination(ESClient& client) {
+    printSection(10, "游标分页演示（PIT + search_after，适合长列表审核）");
+
+    const std::string cursorIndex = "articles_archive";
+
+    // 准备一批"历史文章"：23 篇，日期有重复（考验同分值的确定次序）
+    if (client.indexExists(cursorIndex)) {
+        client.deleteIndex(cursorIndex);
+    }
+    json mappings = {
+        {"properties", {
+            {"title", {{"type", "text"}}},
+            {"content", {{"type", "text"}}},
+            {"category", {{"type", "keyword"}}},
+            {"created_at", {{"type", "date"}, {"format", "yyyy-MM-dd"}}}
+        }}
+    };
+    json settings = {{"number_of_shards", 1}, {"number_of_replicas", 0}};
+    client.createIndex(cursorIndex, mappings, settings);
+
+    std::vector<json> docs;
+    std::vector<std::string> ids;
+    for (int i = 1; i <= 23; ++i) {
+        char day[8];
+        std::snprintf(day, sizeof(day), "%02d", (i % 7) + 1);  // 大量重复日期
+        docs.push_back({
+            {"title", "历史文章 " + std::to_string(i)},
+            {"content", "内容审核团队待复查的历史文章正文 " + std::to_string(i)},
+            {"category", (i % 2 == 0) ? "技术" : "资讯"},
+            {"created_at", std::string("2024-03-") + day}
+        });
+        ids.push_back("article-" + std::to_string(i));
+    }
+    client.bulkIndex(cursorIndex, docs, ids);
+    client.refreshIndex(cursorIndex);
+    printInfo("已准备 23 篇历史文章，页大小 6，开始逐页审核...");
+
+    // 游标分页请求：后续页必须使用完全相同的参数
+    CursorSearchRequest request;
+    request.index = cursorIndex;
+    request.sort = json::array({{{"created_at", "asc"}}});  // 客户端自动追加 _shard_doc 决胜键
+    request.pageSize = 6;
+    request.keepAlive = "2m";        // PIT 保活：异常退出后 ES 按此时长自行回收
+    request.cursorTtlSeconds = 600;  // 游标客户端有效期：审核员可暂停后继续
+
+    try {
+        CursorPage page = client.cursorSearchFirst(request);
+        int pageNo = 1;
+        int total = 0;
+        std::string previousCursor;
+
+        while (true) {
+            std::cout << "\n  --- 第 " << pageNo << " 页 ("
+                      << page.result.hits.size() << " 条，快照共 "
+                      << page.result.total << " 条) ---\n";
+            for (const auto& hit : page.result.hits) {
+                std::cout << "    " << hit.id << "  "
+                          << hit.source["title"].get<std::string>() << "  ["
+                          << hit.source["created_at"].get<std::string>() << "]\n";
+            }
+            total += static_cast<int>(page.result.hits.size());
+
+            // 模拟审核期间的数据变更：第 1 页后新增 1 篇、删除 1 篇
+            if (pageNo == 1) {
+                printInfo("审核期间发生写入：新增 article-new、删除 article-2 ...");
+                client.indexDocument(cursorIndex,
+                                     {{"title", "审核期间新发布"},
+                                      {"content", "这篇文章不应出现在本次审核中"},
+                                      {"category", "资讯"},
+                                      {"created_at", "2024-03-03"}},
+                                     "article-new");
+                client.deleteDocument(cursorIndex, "article-2");
+                client.refreshIndex(cursorIndex);
+            }
+
+            if (!page.hasMore) {
+                printSuccess("已读到末页，PIT 已自动关闭，共审核 " +
+                             std::to_string(total) + " 篇（不含期间新增）");
+                break;
+            }
+            previousCursor = page.nextCursor;
+            page = client.cursorSearchNext(request, page.nextCursor);
+            ++pageNo;
+        }
+
+        // 结束后继续使用旧游标会被拒绝
+        printInfo("尝试在结束后继续使用旧游标...");
+        try {
+            client.cursorSearchNext(request, previousCursor);
+            printError("旧游标未被拒绝（不符合预期）");
+        } catch (const PitNotFoundException& e) {
+            printSuccess(std::string("旧游标已被拒绝（PIT 已释放）: ") + e.what());
+        }
+
+        // 主动结束：读到一半不想继续时关闭 PIT
+        printInfo("演示主动结束：读取一页后调用 closeCursor ...");
+        CursorPage first = client.cursorSearchFirst(request);
+        if (client.closeCursor(first.nextCursor)) {
+            printSuccess("已主动关闭 PIT，审核员可随时中止");
+        }
+    } catch (const std::exception& e) {
+        printError(std::string("游标分页演示失败: ") + e.what());
+    }
+
+    client.deleteIndex(cursorIndex);
+    printInfo("演示索引已清理");
+}
+
 void demoCleanup(ESClient& client, const std::string& indexName) {
-    printSection(10, "清理资源");
+    printSection(11, "清理资源");
     
     try {
         client.deleteIndex(indexName);
@@ -421,7 +530,7 @@ int main() {
         ESClient client(host, port);
         
         // 设置日志回调（可选）
-        client.setLogCallback([](const std::string& msg) {
+        client.setLogCallback([](const std::string& /*msg*/) {
             // std::cout << Color::MAGENTA << "[LOG] " << msg << Color::RESET << "\n";
         });
         
@@ -456,6 +565,7 @@ int main() {
         demoBoolSearch(client, indexName);
         demoHighlightSearch(client, indexName);
         demoDocumentCRUD(client, indexName);
+        demoCursorPagination(client);
         demoCleanup(client, indexName);
         
         printHeader("演示完成！");

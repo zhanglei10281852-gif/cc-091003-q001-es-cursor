@@ -82,9 +82,10 @@ public:
                      const std::map<std::string, std::string>& headers = {});
     
     /**
-     * DELETE 请求
+     * DELETE 请求（可携带 JSON 请求体，如 DELETE /_pit）
      */
     HttpResponse del(const std::string& url,
+                     const std::string& body = "",
                      const std::map<std::string, std::string>& headers = {});
     
     /**

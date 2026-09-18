@@ -37,10 +37,15 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CURL_INCLUDE_DIRS})
 
 # 源文件
-set(SOURCES
-    src/main.cpp
+set(CLIENT_SOURCES
     src/http_client.cpp
     src/es_client.cpp
+    src/sha256.cpp
+)
+
+set(SOURCES
+    src/main.cpp
+    ${CLIENT_SOURCES}
 )
 
 # 可执行文件
@@ -48,6 +53,20 @@ add_executable(es_demo ${SOURCES})
 
 # 链接库
 target_link_libraries(es_demo PRIVATE ${CURL_LIBRARIES})
+
+# ==================== 自动化验证 ====================
+# 游标分页（PIT + search_after）集成测试。
+# 需要可用的 Elasticsearch（真实实例或 tests/mock_es.py），
+# 通过 ES_HOST / ES_PORT 环境变量指定。
+enable_testing()
+
+add_executable(es_cursor_test
+    tests/cursor_test.cpp
+    ${CLIENT_SOURCES}
+)
+target_link_libraries(es_cursor_test PRIVATE ${CURL_LIBRARIES})
+
+add_test(NAME cursor_pagination COMMAND es_cursor_test)
 
 # 安装规则
 install(TARGETS es_demo DESTINATION bin)
