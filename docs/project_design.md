@@ -30,6 +30,7 @@ classDiagram
     class ESClient {
         -string baseUrl
         -HttpClient httpClient
+        -CursorCodec cursorCodec
         +createIndex(indexName, mappings)
         +deleteIndex(indexName)
         +indexDocument(index, id, doc)
@@ -37,6 +38,17 @@ classDiagram
         +deleteDocument(index, id)
         +search(index, query)
         +bulkIndex(index, docs)
+        +openPointInTime(index, keepAlive)
+        +closePointInTime(pitId)
+        +searchByCursor(options)
+        +closeCursor(cursor)
+    }
+
+    class CursorCodec {
+        +generateSecret()
+        +fingerprint(index, query, sort, pageSize)
+        +encode(payload)
+        +decode(cursor)
     }
 
     class HttpClient {
@@ -44,6 +56,7 @@ classDiagram
         +post(url, body, headers)
         +put(url, body, headers)
         +delete(url, headers)
+        +delete(url, body, headers)
     }
 
     class Document {
@@ -55,6 +68,7 @@ classDiagram
     }
 
     ESClient --> HttpClient
+    ESClient --> CursorCodec
     ESClient --> Document
 ```
 
@@ -74,6 +88,10 @@ classDiagram
 | 全文检索 | Bool 查询  | 组合条件查询                   |
 | 全文检索 | 高亮显示   | 搜索结果高亮                   |
 | 全文检索 | 分页查询   | 支持 from/size                 |
+| 游标分页 | 建立快照   | 首次请求创建 PIT 并返回游标    |
+| 游标分页 | 稳定翻页   | search_after 前进，快照隔离并发写入 |
+| 游标分页 | 游标安全   | HMAC 签名 + 检索参数指纹绑定   |
+| 游标分页 | 资源管理   | 末页/主动关闭 PIT，keep_alive 兜底回收 |
 
 ## 4. API 接口设计
 
@@ -93,6 +111,17 @@ classDiagram
 ### 4.3 搜索接口
 
 - `POST /{index}/_search` - 搜索文档
+
+### 4.4 游标分页（Point in Time）
+
+- `POST /{index}/_pit?keep_alive=...` - 建立 PIT 快照
+- `POST /_search`（body 携带 `pit`、`search_after`）- 沿快照翻页
+- `DELETE /_pit`（body 携带 `id`）- 关闭 PIT 快照
+
+游标为不透明字符串，格式 `esc1.<base64url(payload)>.<base64url(hmac)>`，
+payload 包含 PIT id、search_after 排序值、检索参数指纹与过期时间；
+签名密钥由客户端实例持有（默认随机生成，可通过 `setCursorSecret` 指定
+以实现跨进程验证）。
 
 ## 5. 技术选型
 
@@ -114,12 +143,16 @@ es-cpp-demo/
 │   ├── Dockerfile
 │   ├── include/
 │   │   ├── es_client.hpp
+│   │   ├── es_cursor.hpp
 │   │   ├── http_client.hpp
 │   │   └── json.hpp
 │   ├── src/
 │   │   ├── main.cpp
 │   │   ├── es_client.cpp
+│   │   ├── es_cursor.cpp
 │   │   └── http_client.cpp
+│   ├── test/
+│   │   └── cursor_test.cpp
 │   └── data/
 │       └── sample_data.json
 ├── docker-compose.yml

@@ -41,6 +41,7 @@ set(SOURCES
     src/main.cpp
     src/http_client.cpp
     src/es_client.cpp
+    src/es_cursor.cpp
 )
 
 # 可执行文件
@@ -48,6 +49,19 @@ add_executable(es_demo ${SOURCES})
 
 # 链接库
 target_link_libraries(es_demo PRIVATE ${CURL_LIBRARIES})
+
+# ==================== 游标分页自动化验证 ====================
+# 需要运行中的 Elasticsearch（ES_HOST / ES_PORT 环境变量）
+add_executable(cursor_test
+    test/cursor_test.cpp
+    src/http_client.cpp
+    src/es_client.cpp
+    src/es_cursor.cpp
+)
+target_link_libraries(cursor_test PRIVATE ${CURL_LIBRARIES})
+
+enable_testing()
+add_test(NAME cursor_test COMMAND cursor_test)
 
 # 安装规则
 install(TARGETS es_demo DESTINATION bin)

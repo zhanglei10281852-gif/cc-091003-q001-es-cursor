@@ -212,7 +212,7 @@ HttpResponse HttpClient::del(const std::string& url,
                              const std::map<std::string, std::string>& headers) {
     HttpResponse response;
     std::string responseBody;
-    
+
     curl_easy_reset(pImpl->curl);
     curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(pImpl->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -222,7 +222,7 @@ HttpResponse HttpClient::del(const std::string& url,
     curl_easy_setopt(pImpl->curl, CURLOPT_HEADERDATA, &response.headers);
     curl_easy_setopt(pImpl->curl, CURLOPT_TIMEOUT, pImpl->timeout);
     curl_easy_setopt(pImpl->curl, CURLOPT_CONNECTTIMEOUT, pImpl->connectTimeout);
-    
+
     struct curl_slist* headerList = nullptr;
     for (const auto& [key, value] : headers) {
         std::string header = key + ": " + value;
@@ -231,20 +231,59 @@ HttpResponse HttpClient::del(const std::string& url,
     if (headerList) {
         curl_easy_setopt(pImpl->curl, CURLOPT_HTTPHEADER, headerList);
     }
-    
+
     CURLcode res = curl_easy_perform(pImpl->curl);
-    
+
     if (headerList) {
         curl_slist_free_all(headerList);
     }
-    
+
     if (res != CURLE_OK) {
         throw HttpException(std::string("DELETE request failed: ") + curl_easy_strerror(res));
     }
-    
+
     curl_easy_getinfo(pImpl->curl, CURLINFO_RESPONSE_CODE, &response.statusCode);
     response.body = std::move(responseBody);
-    
+
+    return response;
+}
+
+HttpResponse HttpClient::del(const std::string& url,
+                             const std::string& body,
+                             const std::map<std::string, std::string>& headers) {
+    HttpResponse response;
+    std::string responseBody;
+
+    curl_easy_reset(pImpl->curl);
+    curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(pImpl->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDSIZE, body.size());
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEDATA, &responseBody);
+    curl_easy_setopt(pImpl->curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(pImpl->curl, CURLOPT_HEADERDATA, &response.headers);
+    curl_easy_setopt(pImpl->curl, CURLOPT_TIMEOUT, pImpl->timeout);
+    curl_easy_setopt(pImpl->curl, CURLOPT_CONNECTTIMEOUT, pImpl->connectTimeout);
+
+    struct curl_slist* headerList = nullptr;
+    headerList = curl_slist_append(headerList, "Content-Type: application/json");
+    for (const auto& [key, value] : headers) {
+        std::string header = key + ": " + value;
+        headerList = curl_slist_append(headerList, header.c_str());
+    }
+    curl_easy_setopt(pImpl->curl, CURLOPT_HTTPHEADER, headerList);
+
+    CURLcode res = curl_easy_perform(pImpl->curl);
+    curl_slist_free_all(headerList);
+
+    if (res != CURLE_OK) {
+        throw HttpException(std::string("DELETE request failed: ") + curl_easy_strerror(res));
+    }
+
+    curl_easy_getinfo(pImpl->curl, CURLINFO_RESPONSE_CODE, &response.statusCode);
+    response.body = std::move(responseBody);
+
     return response;
 }
 

@@ -132,3 +132,7 @@ secrets*
 # 备份文件
 *.backup
 *.orig
+
+# nlohmann/json（由 CMake 配置阶段自动下载）
+backend/include/json.hpp
+backend/include/nlohmann/

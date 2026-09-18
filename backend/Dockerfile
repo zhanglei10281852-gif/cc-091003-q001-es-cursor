@@ -26,7 +26,9 @@ RUN mkdir -p include && \
 COPY CMakeLists.txt .
 COPY include/http_client.hpp include/
 COPY include/es_client.hpp include/
+COPY include/es_cursor.hpp include/
 COPY src/ src/
+COPY test/ test/
 COPY data/ data/
 
 # 构建项目

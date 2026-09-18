@@ -86,6 +86,13 @@ public:
      */
     HttpResponse del(const std::string& url,
                      const std::map<std::string, std::string>& headers = {});
+
+    /**
+     * DELETE 请求（带 JSON 请求体，如关闭 PIT）
+     */
+    HttpResponse del(const std::string& url,
+                     const std::string& body,
+                     const std::map<std::string, std::string>& headers = {});
     
     /**
      * HEAD 请求

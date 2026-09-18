@@ -44,6 +44,25 @@ make
 ./es_demo
 ```
 
+### 运行自动化验证
+
+游标分页功能附带自动化验证程序（需要可访问的 Elasticsearch）：
+
+```bash
+# 本地编译后运行（默认连接 localhost:9200，可用 ES_HOST/ES_PORT 覆盖）
+cd backend/build
+./cursor_test
+
+# 或通过 ctest 运行
+ctest --output-on-failure
+
+# 或使用 Docker（test profile）
+docker-compose --profile test up --build cursor-test
+```
+
+验证内容：跨多页无重无漏、翻页期间增删文档快照内结果稳定、同分值记录次序确定、
+主动结束/读到末页后旧游标被拒绝、篡改游标被拒绝、游标与检索参数绑定、过期游标被拒绝。
+
 ## 服务说明
 
 | 服务          | 端口 | 说明                       |
@@ -86,7 +105,36 @@ make
 - ✅ Term 查询（精确匹配）
 - ✅ Bool 组合查询
 - ✅ 高亮显示
-- ✅ 分页查询
+- ✅ 分页查询（from/size）
+
+### 稳定游标分页（PIT + search_after）
+
+面向长列表逐页浏览场景（如内容审核），解决 `from/size` 深分页在并发写入时重复/漏记录的问题：
+
+- ✅ 首次请求自动建立 Point in Time 快照，返回结果与不透明的下一页游标
+- ✅ 后续请求沿用同一查询、排序和快照，通过 `search_after` 前进；翻页期间的新增/删除不打乱已开始的浏览
+- ✅ 同分值记录自动追加 `_shard_doc` 决胜排序，次序确定
+- ✅ 游标经 HMAC-SHA256 签名并与索引/查询/排序/页大小绑定，篡改或换用参数即被拒绝
+- ✅ 可区分的失败类型：`CursorTamperedException`（篡改/参数不匹配）、`CursorExpiredException`（超过保活时间）、`PitGoneException`（PIT 已被 ES 释放）
+- ✅ 读到末页自动关闭 PIT，也可 `closeCursor` 主动结束；异常退出后遗留 PIT 由较短的 keep_alive 自动回收
+
+```cpp
+es::CursorSearchOptions options;
+options.indexName = "articles";
+options.query = {{"term", {{"category", "待审核"}}}};
+options.pageSize = 20;
+options.keepAlive = "2m";   // 每次翻页自动续期
+
+while (true) {
+    es::CursorPage page = client.searchByCursor(options);
+    for (const auto& hit : page.result.hits) {
+        // 处理本页记录 ...
+    }
+    if (!page.hasMore) break;          // 末页：PIT 已自动关闭
+    options.cursor = page.nextCursor;  // 继续下一页
+}
+// 中途主动结束：client.closeCursor(page.nextCursor);
+```
 
 ### 分词说明
 
@@ -117,12 +165,16 @@ make
 │   ├── Dockerfile          # Docker 镜像构建
 │   ├── include/            # 头文件
 │   │   ├── es_client.hpp   # ES 客户端类
+│   │   ├── es_cursor.hpp   # 游标编解码（签名、参数指纹）
 │   │   ├── http_client.hpp # HTTP 客户端类
 │   │   └── json.hpp        # nlohmann/json 库
 │   ├── src/                # 源代码
 │   │   ├── main.cpp        # 主程序入口
 │   │   ├── es_client.cpp   # ES 客户端实现
+│   │   ├── es_cursor.cpp   # 游标编解码实现
 │   │   └── http_client.cpp # HTTP 客户端实现
+│   ├── test/               # 自动化验证
+│   │   └── cursor_test.cpp # 游标分页验证程序
 │   └── data/               # 示例数据
 │       └── sample_data.json
 ├── docs/                   # 文档
@@ -140,7 +192,8 @@ make
 2. **批量导入** - 导入示例文章数据
 3. **全文检索** - 演示各种搜索方式
 4. **高亮显示** - 展示搜索结果高亮
-5. **清理资源** - 删除测试索引
+5. **游标分页** - PIT + search_after 稳定翻页，含并发写入、主动结束、篡改检测演示
+6. **清理资源** - 删除测试索引
 
 ### 输出示例
 

@@ -2,12 +2,14 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <ctime>
 
 namespace es {
 
 // ==================== 构造与析构 ====================
 
-ESClient::ESClient(const std::string& host, int port) {
+ESClient::ESClient(const std::string& host, int port)
+    : cursorCodec_(CursorCodec::generateSecret()) {
     std::ostringstream oss;
     oss << "http://" << host << ":" << port;
     baseUrl_ = oss.str();
@@ -261,22 +263,28 @@ SearchResult ESClient::parseSearchResponse(const json& response) {
     SearchResult result;
     result.took = response.value("took", 0);
     result.timedOut = response.value("timed_out", false);
-    
+
     const auto& hits = response["hits"];
     const auto& total = hits["total"];
     result.total = total.is_object() ? total.value("value", 0) : total.get<int>();
-    result.maxScore = hits.value("max_score", 0.0);
-    
+    // 显式排序时 ES 可能返回 null 分数（未开启 track_scores）
+    result.maxScore = hits.contains("max_score") && hits["max_score"].is_number()
+                          ? hits["max_score"].get<double>()
+                          : 0.0;
+
     for (const auto& hit : hits["hits"]) {
         SearchHit searchHit;
         searchHit.id = hit.value("_id", "");
         searchHit.index = hit.value("_index", "");
-        searchHit.score = hit.value("_score", 0.0);
+        searchHit.score = hit.contains("_score") && hit["_score"].is_number()
+                              ? hit["_score"].get<double>()
+                              : 0.0;
         searchHit.source = hit.value("_source", json::object());
         searchHit.highlight = hit.value("highlight", json::object());
+        searchHit.sort = hit.value("sort", json::array());
         result.hits.push_back(searchHit);
     }
-    
+
     return result;
 }
 
@@ -383,12 +391,244 @@ SearchResult ESClient::search(const std::string& indexName,
         buildUrl("/" + indexName + "/_search"),
         queryBody.dump()
     );
-    
+
     if (!response.isSuccess()) {
         throw ESException("Search failed: " + response.body);
     }
-    
+
     return parseSearchResponse(json::parse(response.body));
+}
+
+// ==================== 稳定游标分页（PIT + search_after） ====================
+
+namespace {
+
+/**
+ * 解析 ES 时间表达式为秒数（支持 "30s"、"2m"、"1h"、"1d"，纯数字按秒计）
+ */
+long parseKeepAliveSeconds(const std::string& keepAlive) {
+    if (keepAlive.empty()) {
+        return 60;
+    }
+    long multiplier = 1;
+    std::string num = keepAlive;
+    switch (keepAlive.back()) {
+        case 's': multiplier = 1;     num.pop_back(); break;
+        case 'm': multiplier = 60;    num.pop_back(); break;
+        case 'h': multiplier = 3600;  num.pop_back(); break;
+        case 'd': multiplier = 86400; num.pop_back(); break;
+        default: break;  // 纯数字按秒处理
+    }
+    try {
+        long value = std::stol(num);
+        return value > 0 ? value * multiplier : 60;
+    } catch (const std::exception&) {
+        return 60;
+    }
+}
+
+/**
+ * 规范化查询：缺省为 match_all
+ */
+json normalizeQuery(const json& query) {
+    if (query.is_null() || (query.is_object() && query.empty())) {
+        return {{"match_all", json::object()}};
+    }
+    return query;
+}
+
+/**
+ * 规范化排序：缺省按 _score 降序；确保以 _shard_doc 作为决胜排序，
+ * 保证同分值记录有确定的次序（PIT 搜索专用，随快照保持稳定）。
+ */
+json normalizeSort(const json& sort) {
+    json result;
+    if (sort.is_null() || (sort.is_array() && sort.empty())) {
+        result = json::array({{{"_score", "desc"}}});
+    } else {
+        result = sort;
+    }
+
+    bool hasTiebreaker = false;
+    for (const auto& entry : result) {
+        if ((entry.is_string() && entry.get<std::string>() == "_shard_doc") ||
+            (entry.is_object() && entry.contains("_shard_doc"))) {
+            hasTiebreaker = true;
+            break;
+        }
+    }
+    if (!hasTiebreaker) {
+        result.push_back({{"_shard_doc", "asc"}});
+    }
+    return result;
+}
+
+} // namespace
+
+std::string ESClient::openPointInTime(const std::string& indexName,
+                                      const std::string& keepAlive) {
+    log("Opening point in time on index: " + indexName);
+    auto response = httpClient_.post(
+        buildUrl("/" + indexName + "/_pit?keep_alive=" + keepAlive), "");
+
+    if (!response.isSuccess()) {
+        throw ESException("Failed to open point in time: " + response.body);
+    }
+
+    std::string pitId = json::parse(response.body).value("id", "");
+    if (pitId.empty()) {
+        throw ESException("Failed to open point in time: empty pit id in response");
+    }
+    return pitId;
+}
+
+bool ESClient::closePointInTime(const std::string& pitId) {
+    json body = {{"id", pitId}};
+
+    HttpResponse response;
+    try {
+        response = httpClient_.del(buildUrl("/_pit"), body.dump());
+    } catch (const HttpException& e) {
+        // 关闭是尽力而为的清理动作，失败不抛出，遗留 PIT 由 keep_alive 回收
+        log(std::string("Failed to close point in time: ") + e.what());
+        return false;
+    }
+
+    if (response.isNotFound()) {
+        // PIT 已不存在（已关闭或被回收），视为清理完成
+        return false;
+    }
+    if (!response.isSuccess()) {
+        log("Failed to close point in time: " + response.body);
+        return false;
+    }
+
+    log("Point in time closed");
+    return json::parse(response.body).value("succeeded", false);
+}
+
+CursorPage ESClient::searchByCursor(const CursorSearchOptions& options) {
+    if (options.indexName.empty()) {
+        throw ESException("Cursor search requires an index name");
+    }
+    if (options.pageSize <= 0) {
+        throw ESException("Cursor search requires a positive page size");
+    }
+
+    // 规范化检索参数并计算指纹：游标与参数绑定，
+    // 防止被拿去配合另一组索引 / 查询 / 排序 / 页大小使用
+    json query = normalizeQuery(options.query);
+    json sort = normalizeSort(options.sort);
+    const std::string fp =
+        CursorCodec::fingerprint(options.indexName, query, sort, options.pageSize);
+    const long keepAliveSec = parseKeepAliveSeconds(options.keepAlive);
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+
+    std::string pitId;
+    json searchAfter = json::array();
+
+    if (options.cursor.empty()) {
+        // 首次请求：建立 PIT 快照
+        pitId = openPointInTime(options.indexName, options.keepAlive);
+        log("Point in time opened for cursor pagination");
+    } else {
+        // 后续请求：解码并校验游标
+        auto payload = cursorCodec_.decode(options.cursor);
+        if (!payload) {
+            throw CursorTamperedException(
+                "Cursor is malformed or its signature does not verify");
+        }
+        if (payload->fingerprint != fp) {
+            throw CursorTamperedException(
+                "Cursor was issued for different search parameters "
+                "(index / query / sort / page size do not match)");
+        }
+        if (now > payload->expiresAt) {
+            throw CursorExpiredException(
+                "Cursor has expired (keep_alive elapsed); start a new search");
+        }
+        pitId = payload->pitId;
+        searchAfter = payload->searchAfter;
+    }
+
+    // PIT 搜索：URL 不带索引名，快照上下文在请求体中指定
+    json body = {
+        {"size", options.pageSize},
+        {"query", query},
+        {"sort", sort},
+        {"pit", {{"id", pitId}, {"keep_alive", options.keepAlive}}},
+        {"track_total_hits", true},
+        {"track_scores", true}  // 显式排序时仍返回 _score
+    };
+    if (!searchAfter.empty()) {
+        body["search_after"] = searchAfter;
+    }
+
+    HttpResponse response;
+    try {
+        response = httpClient_.post(buildUrl("/_search"), body.dump());
+    } catch (...) {
+        // 首次请求失败时调用方拿不到游标，立即清理刚建立的 PIT；
+        // 后续请求失败则保留 PIT，调用方可持原游标重试
+        if (options.cursor.empty()) {
+            closePointInTime(pitId);
+        }
+        throw;
+    }
+
+    if (response.isNotFound()) {
+        throw PitGoneException(
+            "Point in time no longer exists on the server "
+            "(already closed or reaped after keep_alive); start a new search");
+    }
+    if (!response.isSuccess()) {
+        // 首次请求失败时清理刚建立的 PIT，避免泄漏
+        if (options.cursor.empty()) {
+            closePointInTime(pitId);
+        }
+        throw ESException("Cursor search failed: " + response.body);
+    }
+
+    json respJson = json::parse(response.body);
+    CursorPage page;
+    page.result = parseSearchResponse(respJson);
+
+    // ES 可能轮换 PIT id，后续请求始终使用响应中最新的
+    std::string latestPitId = respJson.value("pit_id", pitId);
+
+    bool exhausted =
+        page.result.hits.size() < static_cast<size_t>(options.pageSize);
+    if (exhausted) {
+        // 读到末页：自动关闭 PIT，本次会话结束
+        closePointInTime(latestPitId);
+        page.hasMore = false;
+        page.nextCursor.clear();
+    } else {
+        CursorPayload next;
+        next.pitId = latestPitId;
+        next.searchAfter = page.result.hits.back().sort;
+        next.fingerprint = fp;
+        next.expiresAt = now + keepAliveSec;
+        page.nextCursor = cursorCodec_.encode(next);
+        page.hasMore = true;
+    }
+
+    return page;
+}
+
+void ESClient::closeCursor(const std::string& cursor) {
+    auto payload = cursorCodec_.decode(cursor);
+    if (!payload) {
+        throw CursorTamperedException(
+            "Cursor is malformed or its signature does not verify");
+    }
+    // 幂等：PIT 已不存在时 closePointInTime 返回 false，不视为错误
+    closePointInTime(payload->pitId);
+    log("Cursor closed by caller");
+}
+
+void ESClient::setCursorSecret(const std::string& secret) {
+    cursorCodec_ = CursorCodec(secret);
 }
 
 } // namespace es

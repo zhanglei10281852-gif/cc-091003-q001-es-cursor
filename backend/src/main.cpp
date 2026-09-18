@@ -4,6 +4,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 
 using namespace es;
 using json = nlohmann::json;
@@ -391,8 +392,165 @@ void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
     }
 }
 
+void demoCursorPagination(ESClient& client, const std::string& indexName) {
+    printSection(10, "稳定游标分页演示（PIT + search_after）");
+
+    // ---------- 准备：导入一批待审核文章 ----------
+    printInfo("导入 12 篇待审核文章（category=待审核，同分值）...");
+    std::vector<json> reviewDocs;
+    std::vector<std::string> reviewerIds;
+    for (int i = 1; i <= 12; ++i) {
+        reviewDocs.push_back({
+            {"title", "待审核文章 " + std::to_string(i)},
+            {"content", "这是第 " + std::to_string(i) + " 篇等待内容审核的历史文章。"},
+            {"author", "历史作者"},
+            {"category", "待审核"},
+            {"tags", json::array({"审核"})},
+            {"created_at", "2023-01-01"}
+        });
+        reviewerIds.push_back("review-" + std::to_string(i));
+    }
+    client.bulkIndex(indexName, reviewDocs, reviewerIds);
+    client.refreshIndex(indexName);
+    printSuccess("导入完成");
+
+    // ---------- 翻页浏览：期间发生写入，快照保持稳定 ----------
+    printInfo("开始游标分页（term 查询 category=待审核，每页 5 条，全部同分值）...");
+
+    CursorSearchOptions options;
+    options.indexName = indexName;
+    options.query = {{"term", {{"category", "待审核"}}}};
+    options.pageSize = 5;
+    options.keepAlive = "2m";
+
+    std::vector<std::string> collected;
+    int pageNum = 0;
+
+    try {
+        CursorPage page = client.searchByCursor(options);  // 首次请求：建立 PIT
+        while (true) {
+            ++pageNum;
+            std::cout << "\n  第 " << pageNum << " 页 (total=" << page.result.total << "):\n";
+            for (const auto& hit : page.result.hits) {
+                std::cout << "    • " << hit.id << "  "
+                          << hit.source["title"].get<std::string>()
+                          << "  (score: " << std::fixed << std::setprecision(1)
+                          << hit.score << ")\n";
+                collected.push_back(hit.id);
+            }
+
+            if (pageNum == 1) {
+                // 模拟审核期间有并发写入：新增一篇 + 删除一篇
+                printInfo("模拟并发写入：新增 review-new，删除 review-1 ...");
+                client.indexDocument(indexName,
+                    {{"title", "审核期间新增的文章"},
+                     {"content", "这篇文章在翻页期间写入。"},
+                     {"author", "新作者"},
+                     {"category", "待审核"},
+                     {"tags", json::array({"审核"})},
+                     {"created_at", "2024-06-01"}}, "review-new");
+                client.deleteDocument(indexName, "review-1");
+                client.refreshIndex(indexName);
+                printInfo("已写入并刷新，继续翻页（快照内结果不应受影响）");
+            }
+
+            if (!page.hasMore) {
+                printInfo("已到末页，PIT 已自动关闭");
+                break;
+            }
+            options.cursor = page.nextCursor;  // 后续请求沿用同一快照前进
+            page = client.searchByCursor(options);
+        }
+
+        // 校验：无重无漏，且不受并发写入影响
+        std::set<std::string> unique(collected.begin(), collected.end());
+        bool noDup = unique.size() == collected.size();
+        bool sawNew = unique.count("review-new") > 0;
+        bool sawDeleted = unique.count("review-1") > 0;
+
+        std::cout << "\n  共翻阅 " << collected.size() << " 条记录\n";
+        if (noDup && collected.size() == 12 && !sawNew && sawDeleted) {
+            printSuccess("快照内结果稳定：无重复、无遗漏；新增不可见，已删除的 review-1 仍可见");
+        } else {
+            printError("结果异常：重复=" + std::to_string(!noDup) +
+                       " 数量=" + std::to_string(collected.size()) +
+                       " 见到新文档=" + std::to_string(sawNew) +
+                       " 见到已删文档=" + std::to_string(sawDeleted));
+        }
+    } catch (const std::exception& e) {
+        printError(std::string("游标分页失败: ") + e.what());
+    }
+
+    // ---------- 主动结束后，旧游标被拒绝 ----------
+    printInfo("演示主动结束：翻一页后调用 closeCursor ...");
+    std::string staleCursor;
+    try {
+        CursorSearchOptions opts2 = options;
+        opts2.cursor.clear();
+        auto page = client.searchByCursor(opts2);
+        staleCursor = page.nextCursor;
+        client.closeCursor(staleCursor);
+        printSuccess("已主动关闭游标（PIT 已释放）");
+    } catch (const std::exception& e) {
+        printError(std::string("关闭游标失败: ") + e.what());
+    }
+
+    try {
+        CursorSearchOptions opts3 = options;
+        opts3.cursor = staleCursor;
+        client.searchByCursor(opts3);
+        printError("异常：已关闭的游标仍然可用！");
+    } catch (const PitGoneException& e) {
+        printSuccess(std::string("旧游标被拒绝（PIT 已释放）: ") + e.what());
+    } catch (const std::exception& e) {
+        printError(std::string("异常类型不符合预期: ") + e.what());
+    }
+
+    // ---------- 篡改游标被拒绝 ----------
+    printInfo("演示篡改检测：修改游标内容 ...");
+    try {
+        CursorSearchOptions opts4 = options;
+        opts4.cursor.clear();
+        auto page = client.searchByCursor(opts4);
+        std::string tampered = page.nextCursor;
+        // 翻动负载区的一个字符
+        size_t pos = tampered.find('.') + 2;
+        tampered[pos] = (tampered[pos] == 'A') ? 'B' : 'A';
+        client.closeCursor(page.nextCursor);  // 清理 PIT
+
+        CursorSearchOptions opts5 = options;
+        opts5.cursor = tampered;
+        client.searchByCursor(opts5);
+        printError("异常：被篡改的游标仍然可用！");
+    } catch (const CursorTamperedException& e) {
+        printSuccess(std::string("篡改被拒绝: ") + e.what());
+    } catch (const std::exception& e) {
+        printError(std::string("异常类型不符合预期: ") + e.what());
+    }
+
+    // ---------- 换一组参数使用游标被拒绝 ----------
+    printInfo("演示参数绑定：用不同的页大小继续使用旧游标 ...");
+    try {
+        CursorSearchOptions opts6 = options;
+        opts6.cursor.clear();
+        auto page = client.searchByCursor(opts6);
+        std::string cursor = page.nextCursor;
+        client.closeCursor(cursor);  // 清理 PIT（参数校验在本地完成，不影响下面的测试）
+
+        CursorSearchOptions opts7 = options;
+        opts7.cursor = cursor;
+        opts7.pageSize = 10;  // 与首次请求不一致
+        client.searchByCursor(opts7);
+        printError("异常：游标配合不同页大小仍然可用！");
+    } catch (const CursorTamperedException& e) {
+        printSuccess(std::string("参数不匹配被拒绝: ") + e.what());
+    } catch (const std::exception& e) {
+        printError(std::string("异常类型不符合预期: ") + e.what());
+    }
+}
+
 void demoCleanup(ESClient& client, const std::string& indexName) {
-    printSection(10, "清理资源");
+    printSection(11, "清理资源");
     
     try {
         client.deleteIndex(indexName);
@@ -421,7 +579,7 @@ int main() {
         ESClient client(host, port);
         
         // 设置日志回调（可选）
-        client.setLogCallback([](const std::string& msg) {
+        client.setLogCallback([](const std::string& /*msg*/) {
             // std::cout << Color::MAGENTA << "[LOG] " << msg << Color::RESET << "\n";
         });
         
@@ -456,6 +614,7 @@ int main() {
         demoBoolSearch(client, indexName);
         demoHighlightSearch(client, indexName);
         demoDocumentCRUD(client, indexName);
+        demoCursorPagination(client, indexName);
         demoCleanup(client, indexName);
         
         printHeader("演示完成！");
